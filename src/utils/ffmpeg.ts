@@ -30,8 +30,8 @@ async function renderFrameToUint8(frame: ImpactFrame, meta: VideoMetadata): Prom
   const ctx = canvas.getContext('2d')!;
   // transparent background — overlay filter will alpha-composite over the video
   ctx.clearRect(0, 0, meta.width, meta.height);
-  applyAdjustments(ctx, frame.adjustments, meta.width, meta.height);
   await applyLayers(ctx, frame.layers, frame.adjustments, meta.width, meta.height);
+  applyAdjustments(ctx, frame.adjustments, meta.width, meta.height);
 
   const blob = await new Promise<Blob | null>((res) => canvas.toBlob(res, 'image/png'));
   if (!blob) throw new Error('canvas.toBlob returned null — canvas may be tainted or out of memory');
