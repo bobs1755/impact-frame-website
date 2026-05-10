@@ -23,52 +23,57 @@ async function ensureLoaded(): Promise<FFmpeg> {
   return ffmpegInstance;
 }
 
-async function captureVideoFrame(
-  videoFile: File,
-  timeSeconds: number,
+async function loadImageToCanvas(
+  ctx: CanvasRenderingContext2D,
+  bytes: Uint8Array,
   width: number,
   height: number,
-): Promise<HTMLCanvasElement> {
-  const url = URL.createObjectURL(videoFile);
+): Promise<void> {
+  const plainBuffer = bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength) as ArrayBuffer;
+  const blob = new Blob([plainBuffer], { type: 'image/png' });
+  const url = URL.createObjectURL(blob);
   return new Promise((resolve, reject) => {
-    const video = document.createElement('video');
-    video.muted = true;
-    video.preload = 'auto';
-    const canvas = document.createElement('canvas');
-    canvas.width = width;
-    canvas.height = height;
-    const ctx = canvas.getContext('2d')!;
-    const cleanup = () => URL.revokeObjectURL(url);
-    video.addEventListener('seeked', () => {
-      ctx.drawImage(video, 0, 0, width, height);
-      cleanup();
-      resolve(canvas);
-    }, { once: true });
-    video.addEventListener('error', (e) => { cleanup(); reject(e); }, { once: true });
-    video.addEventListener('loadedmetadata', () => { video.currentTime = timeSeconds; }, { once: true });
-    video.src = url;
-    setTimeout(() => { cleanup(); reject(new Error(`Seek timeout at ${timeSeconds}s`)); }, 10000);
+    const img = new Image();
+    img.onload = () => {
+      ctx.drawImage(img, 0, 0, width, height);
+      URL.revokeObjectURL(url);
+      resolve();
+    };
+    img.onerror = () => {
+      URL.revokeObjectURL(url);
+      reject(new Error('Failed to load extracted frame image'));
+    };
+    img.src = url;
   });
 }
 
-async function renderFrameToUint8(frame: ImpactFrame, meta: VideoMetadata, videoFile: File): Promise<Uint8Array> {
+async function renderFrameToUint8(
+  frame: ImpactFrame,
+  meta: VideoMetadata,
+  ffmpeg: FFmpeg,
+): Promise<Uint8Array> {
   const canvas = document.createElement('canvas');
   canvas.width = meta.width;
   canvas.height = meta.height;
   const ctx = canvas.getContext('2d')!;
   ctx.clearRect(0, 0, meta.width, meta.height);
 
-  // If any adjustment needs video pixels (invert, B&W, dither), capture the actual video frame
-  // and bake everything into a fully opaque PNG — identical pipeline to the preview.
-  // Otherwise leave the canvas transparent so the overlay only covers the effect layers.
+  // Adjustments like invert/B&W/dither operate on video pixels.
+  // Use FFmpeg (which already has input.mp4 in its VFS) to extract
+  // the exact frame, draw it on canvas, then apply adjustments.
+  // This matches the preview pipeline exactly.
   const needsVideoPixels =
     frame.adjustments.invertColor ||
     frame.adjustments.bAndW ||
     frame.adjustments.dithering !== 'none';
 
   if (needsVideoPixels) {
-    const videoCanvas = await captureVideoFrame(videoFile, frame.videoFrameNumber / meta.fps, meta.width, meta.height);
-    ctx.drawImage(videoCanvas, 0, 0);
+    const t = (frame.videoFrameNumber / meta.fps).toFixed(6);
+    await ffmpeg.exec(['-ss', t, '-i', 'input.mp4', '-vframes', '1', '_frame.png']);
+    const raw = await ffmpeg.readFile('_frame.png');
+    await ffmpeg.deleteFile('_frame.png');
+    const bytes = raw instanceof Uint8Array ? raw : new TextEncoder().encode(raw as string);
+    await loadImageToCanvas(ctx, bytes, meta.width, meta.height);
   }
 
   applyAdjustments(ctx, frame.adjustments, meta.width, meta.height);
@@ -96,11 +101,8 @@ export async function exportVideo(
 ): Promise<Blob> {
   const ffmpeg = await ensureLoaded();
 
-  // Capture all FFmpeg log output so we can surface meaningful errors
   const logs: string[] = [];
-  const logHandler = ({ message }: { message: string }) => {
-    logs.push(message);
-  };
+  const logHandler = ({ message }: { message: string }) => { logs.push(message); };
   const progressHandler = ({ progress }: { progress: number }) => {
     onProgress?.(Math.min(Math.round(progress * 100), 99));
   };
@@ -108,7 +110,6 @@ export async function exportVideo(
   ffmpeg.on('progress', progressHandler);
 
   try {
-    // Write input video (FFmpeg auto-detects format from headers, not extension)
     await ffmpeg.writeFile('input.mp4', await fetchFile(videoFile));
 
     const activeFrames = impactFrames
@@ -123,23 +124,22 @@ export async function exportVideo(
         logs,
       );
     } else {
-      // Write each impact frame PNG. Frames with invert/B&W/dither have the captured video
-      // frame baked in (fully opaque), so FFmpeg's overlay replaces those frames entirely.
-      // Frames with only dimming/layers remain transparent and alpha-composite as before.
+      // For frames with invert/B&W/dither: FFmpeg extracts the video frame, adjustments are
+      // applied on canvas, result is a fully opaque PNG that replaces those video frames.
+      // For frames with only dimming/layers: transparent PNG composites over the video.
       for (let i = 0; i < activeFrames.length; i++) {
-        const png = await renderFrameToUint8(activeFrames[i], meta, videoFile);
+        const png = await renderFrameToUint8(activeFrames[i], meta, ffmpeg);
         await ffmpeg.writeFile(`impact_${i}.png`, png);
       }
 
-      // Build input list: video first, then each looped overlay image
       const inputs: string[] = ['-i', 'input.mp4'];
       for (let i = 0; i < activeFrames.length; i++) {
         inputs.push('-loop', '1', '-i', `impact_${i}.png`);
       }
 
-      // Chain overlay filters.
-      // The overlay filter composites the PNG alpha over the video automatically.
-      // After all overlays, format=yuv420p drops the alpha channel so libx264 can encode it.
+      // Chain overlay filters. Fully opaque PNGs replace those frames entirely;
+      // transparent PNGs alpha-composite over the video.
+      // format=yuv420p on the last step strips alpha so libx264 can encode it.
       let lastLabel = '[0:v]';
       const filters: string[] = [];
       for (let i = 0; i < activeFrames.length; i++) {
@@ -163,8 +163,8 @@ export async function exportVideo(
           '-map', '0:a:0?',
           '-c:v', 'libx264',
           '-preset', 'ultrafast',
-          '-pix_fmt', 'yuv420p',   // required for H.264 compatibility
-          '-c:a', 'copy',           // copy audio — no re-encode
+          '-pix_fmt', 'yuv420p',
+          '-c:a', 'copy',
           '-shortest',
           'output.mp4',
         ],
@@ -178,7 +178,6 @@ export async function exportVideo(
       throw new Error(`FFmpeg produced an empty file.\n\nLogs:\n${logs.slice(-20).join('\n')}`);
     }
 
-    // Copy into a plain ArrayBuffer (avoids SharedArrayBuffer type constraint)
     const out = new ArrayBuffer(uint8.byteLength);
     new Uint8Array(out).set(uint8);
     onProgress?.(100);
