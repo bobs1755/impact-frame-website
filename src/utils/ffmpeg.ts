@@ -1,7 +1,7 @@
 import { FFmpeg } from '@ffmpeg/ffmpeg';
 import { fetchFile, toBlobURL } from '@ffmpeg/util';
 import type { ImpactFrame, VideoMetadata } from '../types';
-import { applyLayers, applyAdjustments } from '../effects/effectRegistry';
+import { applyLayers } from '../effects/effectRegistry';
 
 let ffmpegInstance: FFmpeg | null = null;
 let loadPromise: Promise<boolean> | null = null;
