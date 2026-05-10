@@ -1,7 +1,7 @@
 import { FFmpeg } from '@ffmpeg/ffmpeg';
 import { fetchFile, toBlobURL } from '@ffmpeg/util';
 import type { ImpactFrame, VideoMetadata } from '../types';
-import { applyLayers } from '../effects/effectRegistry';
+import { applyLayers, applyAdjustments } from '../effects/effectRegistry';
 
 let ffmpegInstance: FFmpeg | null = null;
 let loadPromise: Promise<boolean> | null = null;
@@ -23,23 +23,55 @@ async function ensureLoaded(): Promise<FFmpeg> {
   return ffmpegInstance;
 }
 
-async function renderFrameToUint8(frame: ImpactFrame, meta: VideoMetadata): Promise<Uint8Array> {
+async function captureVideoFrame(
+  videoFile: File,
+  timeSeconds: number,
+  width: number,
+  height: number,
+): Promise<HTMLCanvasElement> {
+  const url = URL.createObjectURL(videoFile);
+  return new Promise((resolve, reject) => {
+    const video = document.createElement('video');
+    video.muted = true;
+    video.preload = 'auto';
+    const canvas = document.createElement('canvas');
+    canvas.width = width;
+    canvas.height = height;
+    const ctx = canvas.getContext('2d')!;
+    const cleanup = () => URL.revokeObjectURL(url);
+    video.addEventListener('seeked', () => {
+      ctx.drawImage(video, 0, 0, width, height);
+      cleanup();
+      resolve(canvas);
+    }, { once: true });
+    video.addEventListener('error', (e) => { cleanup(); reject(e); }, { once: true });
+    video.addEventListener('loadedmetadata', () => { video.currentTime = timeSeconds; }, { once: true });
+    video.src = url;
+    setTimeout(() => { cleanup(); reject(new Error(`Seek timeout at ${timeSeconds}s`)); }, 10000);
+  });
+}
+
+async function renderFrameToUint8(frame: ImpactFrame, meta: VideoMetadata, videoFile: File): Promise<Uint8Array> {
   const canvas = document.createElement('canvas');
   canvas.width = meta.width;
   canvas.height = meta.height;
   const ctx = canvas.getContext('2d')!;
   ctx.clearRect(0, 0, meta.width, meta.height);
 
-  // Dimming is a pure overlay op: a semi-transparent black rect that darkens the video underneath.
-  // Invert/B&W/dither are applied to the video stream via FFmpeg filters, not baked into the PNG.
-  if (frame.adjustments.dimming > 0) {
-    ctx.save();
-    ctx.globalAlpha = frame.adjustments.dimming;
-    ctx.fillStyle = '#000000';
-    ctx.fillRect(0, 0, meta.width, meta.height);
-    ctx.restore();
+  // If any adjustment needs video pixels (invert, B&W, dither), capture the actual video frame
+  // and bake everything into a fully opaque PNG — identical pipeline to the preview.
+  // Otherwise leave the canvas transparent so the overlay only covers the effect layers.
+  const needsVideoPixels =
+    frame.adjustments.invertColor ||
+    frame.adjustments.bAndW ||
+    frame.adjustments.dithering !== 'none';
+
+  if (needsVideoPixels) {
+    const videoCanvas = await captureVideoFrame(videoFile, frame.videoFrameNumber / meta.fps, meta.width, meta.height);
+    ctx.drawImage(videoCanvas, 0, 0);
   }
 
+  applyAdjustments(ctx, frame.adjustments, meta.width, meta.height);
   await applyLayers(ctx, frame.layers, frame.adjustments, meta.width, meta.height);
 
   const blob = await new Promise<Blob | null>((res) => canvas.toBlob(res, 'image/png'));
@@ -91,9 +123,11 @@ export async function exportVideo(
         logs,
       );
     } else {
-      // Write each impact frame as a transparent PNG
+      // Write each impact frame PNG. Frames with invert/B&W/dither have the captured video
+      // frame baked in (fully opaque), so FFmpeg's overlay replaces those frames entirely.
+      // Frames with only dimming/layers remain transparent and alpha-composite as before.
       for (let i = 0; i < activeFrames.length; i++) {
-        const png = await renderFrameToUint8(activeFrames[i], meta);
+        const png = await renderFrameToUint8(activeFrames[i], meta, videoFile);
         await ffmpeg.writeFile(`impact_${i}.png`, png);
       }
 
@@ -103,30 +137,11 @@ export async function exportVideo(
         inputs.push('-loop', '1', '-i', `impact_${i}.png`);
       }
 
-      // Build video-level filters for adjustments that require pixel access to the video
-      // (invert, B&W, dithering). These can't be baked into the PNG overlay since the
-      // overlay doesn't contain the video pixels — FFmpeg must apply them to the video stream.
-      const vFilterParts: string[] = [];
-      for (const frame of activeFrames) {
-        const s = (frame.videoFrameNumber / meta.fps).toFixed(6);
-        const e = ((frame.videoFrameNumber + frame.durationFrames) / meta.fps).toFixed(6);
-        const t = `between(t,${s},${e})`;
-        if (frame.adjustments.invertColor) {
-          vFilterParts.push(`negate=enable='${t}'`);
-        }
-        if (frame.adjustments.bAndW || frame.adjustments.dithering !== 'none') {
-          vFilterParts.push(`hue=s=0:enable='${t}'`);
-        }
-      }
-
-      const hasVFilters = vFilterParts.length > 0;
-      let lastLabel = hasVFilters ? '[vfilt]' : '[0:v]';
+      // Chain overlay filters.
+      // The overlay filter composites the PNG alpha over the video automatically.
+      // After all overlays, format=yuv420p drops the alpha channel so libx264 can encode it.
+      let lastLabel = '[0:v]';
       const filters: string[] = [];
-
-      if (hasVFilters) {
-        filters.push(`[0:v]${vFilterParts.join(',')}[vfilt]`);
-      }
-
       for (let i = 0; i < activeFrames.length; i++) {
         const s = (activeFrames[i].videoFrameNumber / meta.fps).toFixed(6);
         const e = ((activeFrames[i].videoFrameNumber + activeFrames[i].durationFrames) / meta.fps).toFixed(6);
