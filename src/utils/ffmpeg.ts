@@ -28,10 +28,19 @@ async function renderFrameToUint8(frame: ImpactFrame, meta: VideoMetadata): Prom
   canvas.width = meta.width;
   canvas.height = meta.height;
   const ctx = canvas.getContext('2d')!;
-  // transparent background — overlay filter will alpha-composite over the video
   ctx.clearRect(0, 0, meta.width, meta.height);
+
+  // Dimming is a pure overlay op: a semi-transparent black rect that darkens the video underneath.
+  // Invert/B&W/dither are applied to the video stream via FFmpeg filters, not baked into the PNG.
+  if (frame.adjustments.dimming > 0) {
+    ctx.save();
+    ctx.globalAlpha = frame.adjustments.dimming;
+    ctx.fillStyle = '#000000';
+    ctx.fillRect(0, 0, meta.width, meta.height);
+    ctx.restore();
+  }
+
   await applyLayers(ctx, frame.layers, frame.adjustments, meta.width, meta.height);
-  applyAdjustments(ctx, frame.adjustments, meta.width, meta.height);
 
   const blob = await new Promise<Blob | null>((res) => canvas.toBlob(res, 'image/png'));
   if (!blob) throw new Error('canvas.toBlob returned null — canvas may be tainted or out of memory');
@@ -94,17 +103,34 @@ export async function exportVideo(
         inputs.push('-loop', '1', '-i', `impact_${i}.png`);
       }
 
-      // Chain overlay filters.
-      // The overlay filter composites the PNG alpha over the video automatically.
-      // After all overlays, format=yuv420p drops the alpha channel so libx264
-      // can encode it — H.264 has no alpha channel.
-      let lastLabel = '[0:v]';
+      // Build video-level filters for adjustments that require pixel access to the video
+      // (invert, B&W, dithering). These can't be baked into the PNG overlay since the
+      // overlay doesn't contain the video pixels — FFmpeg must apply them to the video stream.
+      const vFilterParts: string[] = [];
+      for (const frame of activeFrames) {
+        const s = (frame.videoFrameNumber / meta.fps).toFixed(6);
+        const e = ((frame.videoFrameNumber + frame.durationFrames) / meta.fps).toFixed(6);
+        const t = `between(t,${s},${e})`;
+        if (frame.adjustments.invertColor) {
+          vFilterParts.push(`negate=enable='${t}'`);
+        }
+        if (frame.adjustments.bAndW || frame.adjustments.dithering !== 'none') {
+          vFilterParts.push(`hue=s=0:enable='${t}'`);
+        }
+      }
+
+      const hasVFilters = vFilterParts.length > 0;
+      let lastLabel = hasVFilters ? '[vfilt]' : '[0:v]';
       const filters: string[] = [];
+
+      if (hasVFilters) {
+        filters.push(`[0:v]${vFilterParts.join(',')}[vfilt]`);
+      }
+
       for (let i = 0; i < activeFrames.length; i++) {
         const s = (activeFrames[i].videoFrameNumber / meta.fps).toFixed(6);
         const e = ((activeFrames[i].videoFrameNumber + activeFrames[i].durationFrames) / meta.fps).toFixed(6);
         const isLast = i === activeFrames.length - 1;
-        // On the last overlay, chain format=yuv420p inline to strip alpha before the encoder
         const outLabel = isLast ? '[vout]' : `[v${i}]`;
         const formatSuffix = isLast ? ',format=yuv420p' : '';
         filters.push(

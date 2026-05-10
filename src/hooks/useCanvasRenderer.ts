@@ -32,13 +32,8 @@ export function useCanvasRenderer(
     }
 
     if (activeImpactFrame) {
-      const overlay = document.createElement('canvas');
-      overlay.width = width;
-      overlay.height = height;
-      const octx = overlay.getContext('2d')!;
-      await applyLayers(octx, activeImpactFrame.layers, activeImpactFrame.adjustments, width, height);
-      applyAdjustments(octx, activeImpactFrame.adjustments, width, height);
-      ctx.drawImage(overlay, 0, 0);
+      applyAdjustments(ctx, activeImpactFrame.adjustments, width, height);
+      await applyLayers(ctx, activeImpactFrame.layers, activeImpactFrame.adjustments, width, height);
     }
   }, [canvasRef, currentFrameDataUrl, activeImpactFrame, width, height]);
 
